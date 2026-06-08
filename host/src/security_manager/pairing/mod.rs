@@ -89,6 +89,12 @@ pub trait PairingOps<P: PacketPool> {
     /// The local identity address (public or static random), used for Identity Address Information.
     /// This is distinct from the address used for pairing calculations, which may be an RPA.
     fn local_identity_address(&self) -> Result<Address, Error>;
+    /// Whether this connection used a local Resolvable Private Address (i.e. the
+    /// peripheral advertised with an RPA). The peripheral should only distribute
+    /// its IRK when this is true; distributing an IRK while advertising with a
+    /// static address is meaningless to the peer and is rejected by some centrals
+    /// (notably macOS).
+    fn local_used_rpa(&self) -> bool;
 }
 
 #[derive(Debug)]
@@ -420,6 +426,7 @@ mod tests {
         pub(crate) bond_information: Option<BondInformation>,
         pub(crate) bondable: bool,
         pub(crate) oob_available: bool,
+        pub(crate) used_rpa: bool,
         pub(crate) secret_key: crate::security_manager::crypto::SecretKey,
         pub(crate) public_key: crate::security_manager::crypto::PublicKey,
     }
@@ -436,6 +443,9 @@ mod tests {
                 bond_information: None,
                 bondable: false,
                 oob_available: false,
+                // Default to having advertised with an RPA so tests exercise the
+                // responder IRK distribution path.
+                used_rpa: true,
                 secret_key,
                 public_key,
             }
@@ -523,6 +533,10 @@ mod tests {
 
         fn local_identity_address(&self) -> Result<Address, Error> {
             Ok(Address::random([0xff, 0x8f, 0x08, 0x05, 0xe4, 0xff]))
+        }
+
+        fn local_used_rpa(&self) -> bool {
+            self.used_rpa
         }
     }
 

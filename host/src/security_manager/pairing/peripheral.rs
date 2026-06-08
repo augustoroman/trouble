@@ -498,17 +498,23 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Do not agree to distribute our identity key (IRK). A peripheral only
-        // needs to distribute its IRK when it advertises with a Resolvable
-        // Private Address it wants centrals to resolve later; this stack's users
-        // advertise with a static identity address. Distributing an IRK alongside
-        // a static address that the central connected to directly causes some
-        // centrals (notably macOS) to reject pairing with an unspecified-reason
-        // failure. Resolving the *peer's* rotating RPA on reconnect is
-        // unaffected: that uses the central's IRK, which it still distributes.
+        // Agree to distribute our identity key (IRK) only if this connection used
+        // a local Resolvable Private Address — i.e. we advertised with an RPA the
+        // central will want to resolve on a later reconnect. When we advertise
+        // with a static identity address, distributing an IRK is meaningless (the
+        // central already has our stable address) and some centrals (notably
+        // macOS) reject pairing with an unspecified-reason failure. Resolving the
+        // *peer's* rotating RPA on reconnect is unaffected: that uses the
+        // central's IRK, which it still distributes.
         //
         // (Previously this agreed unconditionally and sent a zero IRK when no
         // local IRK existed, which is also what macOS rejects.)
+        if peer_features.responder_key_distribution.identity_key() && ops.local_used_rpa() {
+            pairing_data
+                .local_features
+                .responder_key_distribution
+                .set_identity_key();
+        }
 
         pairing_data.peer_features = peer_features;
         let mut auth_req = AuthReq::new(ops.bonding_flag());
@@ -952,6 +958,51 @@ mod tests {
             assert_eq!(pairing_ops.encryptions.len(), 1);
             assert!(matches!(pairing_ops.encryptions[0], LongTermKey(_)));
         }
+    }
+
+    /// The peripheral agrees to distribute its IRK (responder identity-key bit
+    /// set in the pairing response) only when it advertised with a local RPA. A
+    /// central requesting the responder IRK gets it iff `used_rpa` is true.
+    #[test]
+    fn responder_irk_distribution_gated_on_local_rpa() {
+        // Pairing request with the central asking for the *responder's* identity
+        // key (responder key distribution byte = 0x02).
+        let pairing_request = [
+            0x03, // IO Capabilities
+            0x00, // OOB data flag
+            0x09, // Auth Req (Secure Connection + Bonding)
+            16,   // Maximum Encryption Key Size
+            0x00, // Initiator Key Distribution
+            0x02, // Responder Key Distribution (identity_key = true)
+        ];
+
+        // Byte 5 of the response payload is the responder key distribution field.
+        let responder_keydist = |used_rpa: bool| -> u8 {
+            let mut ops: TestOps<10> = TestOps::new(0xDEAD);
+            ops.bondable = true;
+            ops.used_rpa = used_rpa;
+            let mut pairing_data = make_default_pairing_data(
+                Address::random([1, 2, 3, 4, 5, 6]),
+                Address::random([7, 8, 9, 10, 11, 12]),
+                IoCapabilities::NoInputNoOutput,
+            );
+            let mut pairing = Pairing::new();
+            let mut rng: ChaCha12Rng = ChaCha12Core::seed_from_u64(1).into();
+            pairing
+                .handle_input::<HeaplessPool, _, _>(
+                    Input::Command(Command::PairingRequest, &pairing_request),
+                    &mut pairing_data,
+                    &mut ops,
+                    &mut rng,
+                )
+                .unwrap();
+            ops.sent_packets[0].payload()[5]
+        };
+
+        // Advertised with an RPA: distribute the IRK (responder id-key bit set).
+        assert_eq!(responder_keydist(true) & 0x02, 0x02);
+        // Advertised with a static address: do NOT distribute the IRK.
+        assert_eq!(responder_keydist(false) & 0x02, 0x00);
     }
 
     #[test]
