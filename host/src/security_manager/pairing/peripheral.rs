@@ -498,14 +498,17 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Always agree to distribute identity key when the peer requests it,
-        // even without a local IRK — we'll send a zero IRK with our identity address.
-        if peer_features.responder_key_distribution.identity_key() {
-            pairing_data
-                .local_features
-                .responder_key_distribution
-                .set_identity_key();
-        }
+        // Do not agree to distribute our identity key (IRK). A peripheral only
+        // needs to distribute its IRK when it advertises with a Resolvable
+        // Private Address it wants centrals to resolve later; this stack's users
+        // advertise with a static identity address. Distributing an IRK alongside
+        // a static address that the central connected to directly causes some
+        // centrals (notably macOS) to reject pairing with an unspecified-reason
+        // failure. Resolving the *peer's* rotating RPA on reconnect is
+        // unaffected: that uses the central's IRK, which it still distributes.
+        //
+        // (Previously this agreed unconditionally and sent a zero IRK when no
+        // local IRK existed, which is also what macOS rejects.)
 
         pairing_data.peer_features = peer_features;
         let mut auth_req = AuthReq::new(ops.bonding_flag());
