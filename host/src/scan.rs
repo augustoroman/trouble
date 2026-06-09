@@ -121,7 +121,13 @@ impl<'d, C: Controller, P: PacketPool> Scanner<'d, C, P> {
         );
         host.command(params).await?;
 
-        host.command(LeSetScanEnable::new(true, true)).await?;
+        // filter_duplicates = false: the controller re-reports every advertising
+        // event, not just the first per advertiser. Consumers that track which
+        // devices are currently present (via a last-seen timestamp) need the
+        // repeated reports to detect both newly-appeared and now-absent devices.
+        // (cyw43/RP2040 only supports legacy scanning, so this legacy path is the
+        // only place to control duplicate filtering.)
+        host.command(LeSetScanEnable::new(true, false)).await?;
         drop.defuse();
         Ok(ScanSession {
             command_state: &self.central.host.scan_command_state,
