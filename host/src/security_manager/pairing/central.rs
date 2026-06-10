@@ -146,10 +146,16 @@ impl Pairing {
                 .local_features
                 .responder_key_distribution
                 .set_encryption_key();
-            pairing_data
-                .local_features
-                .initiator_key_distribution
-                .set_identity_key();
+            // Offer to distribute our own IRK only if this connection used a
+            // local Resolvable Private Address the peer will need to resolve on
+            // a later reconnect (see the responder-side note in peripheral.rs).
+            if ops.local_used_rpa() {
+                pairing_data
+                    .local_features
+                    .initiator_key_distribution
+                    .set_identity_key();
+            }
+            // Always request the peer's IRK so we can resolve their RPAs.
             pairing_data
                 .local_features
                 .responder_key_distribution
@@ -380,11 +386,16 @@ impl Pairing {
                 .local_features
                 .responder_key_distribution
                 .set_encryption_key();
-            // Always request the peer's IRK so we can resolve their RPAs
-            pairing_data
-                .local_features
-                .initiator_key_distribution
-                .set_identity_key();
+            // Offer to distribute our own IRK only if this connection used a
+            // local Resolvable Private Address the peer will need to resolve on
+            // a later reconnect (see the responder-side note in peripheral.rs).
+            if ops.local_used_rpa() {
+                pairing_data
+                    .local_features
+                    .initiator_key_distribution
+                    .set_identity_key();
+            }
+            // Always request the peer's IRK so we can resolve their RPAs.
             pairing_data
                 .local_features
                 .responder_key_distribution
@@ -907,5 +918,54 @@ impl Pairing {
         let identity_address = ops.local_identity_address()?;
         let packet = make_identity_address_information_packet(&identity_address)?;
         ops.try_send_packet(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pairing;
+    use crate::security_manager::pairing::tests::{HeaplessPool, TestOps};
+    use crate::security_manager::pairing::PairingData;
+    use crate::security_manager::types::PairingFeatures;
+    use crate::{Address, IoCapabilities};
+
+    /// Initiate central pairing with bonding enabled and return the local
+    /// key-distribution features that will go into the pairing request.
+    fn initiate_features(used_rpa: bool) -> PairingFeatures {
+        use embassy_time::Instant;
+
+        use crate::security_manager::pairing::util::PairingMethod;
+
+        let mut ops: TestOps<10> = TestOps::new(0xDEAD);
+        ops.bondable = true;
+        ops.used_rpa = used_rpa;
+        let mut pairing_data = PairingData {
+            local_address: Address::random([1, 2, 3, 4, 5, 6]),
+            peer_address: Address::random([7, 8, 9, 10, 11, 12]),
+            local_features: PairingFeatures {
+                io_capabilities: IoCapabilities::NoInputNoOutput,
+                ..Default::default()
+            },
+            pairing_method: PairingMethod::JustWorks,
+            peer_features: PairingFeatures::default(),
+            timeout_at: Instant::now() + crate::security_manager::constants::TIMEOUT,
+            bond_information: None,
+        };
+        Pairing::initiate::<HeaplessPool, _>(&mut pairing_data, &mut ops, false).unwrap();
+        pairing_data.local_features
+    }
+
+    /// The central offers its own IRK (initiator identity key) only when this
+    /// connection used a local RPA, but always requests the peer's IRK
+    /// (responder identity key) so it can resolve the peer's RPAs.
+    #[test]
+    fn initiator_irk_distribution_gated_on_local_rpa() {
+        let with_rpa = initiate_features(true);
+        assert!(with_rpa.initiator_key_distribution.identity_key());
+        assert!(with_rpa.responder_key_distribution.identity_key());
+
+        let without_rpa = initiate_features(false);
+        assert!(!without_rpa.initiator_key_distribution.identity_key());
+        assert!(without_rpa.responder_key_distribution.identity_key());
     }
 }

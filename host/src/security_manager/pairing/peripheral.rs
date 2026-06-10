@@ -498,9 +498,20 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Always agree to distribute identity key when the peer requests it,
-        // even without a local IRK — we'll send a zero IRK with our identity address.
-        if peer_features.responder_key_distribution.identity_key() {
+        // Agree to distribute our identity key (IRK) only if this connection
+        // used a local Resolvable Private Address — i.e. the peer connected to
+        // an RPA it will need to resolve on a later reconnect. An IRK is only
+        // useful to the peer for resolving the local device's future RPAs; when
+        // the local device uses its identity address directly there is nothing
+        // to resolve, so distributing an IRK is at best meaningless and at
+        // worst harmful: a peer that stores it in a controller resolving list
+        // using network privacy mode (the default) may thereafter ignore
+        // advertising from the identity address entirely. This also removes the
+        // previous fallback of distributing an all-zero IRK when no local IRK
+        // was configured; reference stacks (e.g. Zephyr) only distribute the
+        // identity key when privacy is in use, and never a zero IRK. Requesting
+        // the *peer's* IRK (above) is unaffected.
+        if peer_features.responder_key_distribution.identity_key() && ops.local_used_rpa() {
             pairing_data
                 .local_features
                 .responder_key_distribution
@@ -949,6 +960,51 @@ mod tests {
             assert_eq!(pairing_ops.encryptions.len(), 1);
             assert!(matches!(pairing_ops.encryptions[0], LongTermKey(_)));
         }
+    }
+
+    /// The peripheral agrees to distribute its IRK (responder identity-key bit
+    /// set in the pairing response) only when it advertised with a local RPA. A
+    /// central requesting the responder IRK gets it iff `used_rpa` is true.
+    #[test]
+    fn responder_irk_distribution_gated_on_local_rpa() {
+        // Pairing request with the central asking for the *responder's* identity
+        // key (responder key distribution byte = 0x02).
+        let pairing_request = [
+            0x03, // IO Capabilities
+            0x00, // OOB data flag
+            0x09, // Auth Req (Secure Connection + Bonding)
+            16,   // Maximum Encryption Key Size
+            0x00, // Initiator Key Distribution
+            0x02, // Responder Key Distribution (identity_key = true)
+        ];
+
+        // Byte 5 of the response payload is the responder key distribution field.
+        let responder_keydist = |used_rpa: bool| -> u8 {
+            let mut ops: TestOps<10> = TestOps::new(0xDEAD);
+            ops.bondable = true;
+            ops.used_rpa = used_rpa;
+            let mut pairing_data = make_default_pairing_data(
+                Address::random([1, 2, 3, 4, 5, 6]),
+                Address::random([7, 8, 9, 10, 11, 12]),
+                IoCapabilities::NoInputNoOutput,
+            );
+            let mut pairing = Pairing::new();
+            let mut rng: ChaCha12Rng = ChaCha12Core::seed_from_u64(1).into();
+            pairing
+                .handle_input::<HeaplessPool, _, _>(
+                    Input::Command(Command::PairingRequest, &pairing_request),
+                    &mut pairing_data,
+                    &mut ops,
+                    &mut rng,
+                )
+                .unwrap();
+            ops.sent_packets[0].payload()[5]
+        };
+
+        // Advertised with an RPA: distribute the IRK (responder id-key bit set).
+        assert_eq!(responder_keydist(true) & 0x02, 0x02);
+        // Advertised with a static address: do NOT distribute the IRK.
+        assert_eq!(responder_keydist(false) & 0x02, 0x00);
     }
 
     #[test]

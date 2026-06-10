@@ -1282,4 +1282,8 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
     fn local_identity_address(&self) -> Result<Address, Error> {
         self.state.local_address.ok_or(Error::InvalidValue)
     }
+
+    fn local_used_rpa(&self) -> bool {
+        self.storage.resolvable_addrs.local.is_some()
+    }
 }
