@@ -55,9 +55,9 @@ use bt_hci::param::{
     Status,
 };
 use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
-use embassy_futures::select::{select3, select5, Either3, Either5};
-#[cfg(any(feature = "scan", feature = "security"))]
+use embassy_futures::select::{select3, select6, Either3, Either6};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::Channel;
 #[cfg(feature = "security")]
 use embassy_sync::mutex::Mutex;
 use embassy_sync::once_lock::OnceLock;
@@ -154,7 +154,15 @@ pub(crate) struct HostState<'d, P: PacketPool> {
     pub(crate) resolving_list_state: RefCell<ResolvingListSignal>,
     #[cfg(feature = "scan")]
     pub(crate) scan_timeout: Signal<NoopRawMutex, ()>,
+    /// Connections the host could not accept, waiting for the control runner
+    /// to disconnect them. See [`BleHost::reject_connection`].
+    pub(crate) rejected_connections: Channel<NoopRawMutex, ConnHandle, REJECTED_CONNECTIONS_MAX>,
 }
+
+/// How many rejected connections can wait for their `Disconnect` at once.
+/// Rejections happen only when the connection table is full, so a few slots
+/// cover a burst of simultaneous connects.
+const REJECTED_CONNECTIONS_MAX: usize = 4;
 
 impl<'d, P: PacketPool> HostState<'d, P> {
     pub(crate) fn new(
@@ -187,6 +195,7 @@ impl<'d, P: PacketPool> HostState<'d, P> {
             resolving_list_state: RefCell::new(ResolvingListSignal::new()),
             #[cfg(feature = "scan")]
             scan_timeout: Signal::new(),
+            rejected_connections: Channel::new(),
         }
     }
 }
@@ -682,6 +691,22 @@ where
     #[cfg(feature = "iso")]
     pub(crate) async fn write_iso_data(&self, packet: &bt_hci::data::IsoPacket<'_>) -> Result<(), T::Error> {
         self.controller.write_iso_data(packet).await
+    }
+
+    /// Queue a connection the host could not accept for disconnection by the
+    /// control runner.
+    ///
+    /// The receive loop must not issue the `Disconnect` itself: the command
+    /// waits for a Command Status event that only the receive loop can read,
+    /// and the command permit it holds blocks every other command meanwhile.
+    /// If the permit is unavailable, awaiting it there deadlocks the stack.
+    fn reject_connection(&self, handle: ConnHandle) {
+        if self.state.rejected_connections.try_send(handle).is_err() {
+            warn!(
+                "[host] rejected connection queue full; {:?} left to the supervision timeout",
+                handle
+            );
+        }
     }
 
     fn handle_connection(
@@ -1442,12 +1467,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         #[cfg(feature = "security")]
                                         ResolvablePrivateAddrs::none(),
                                     ) {
-                                        let _ = host
-                                            .async_command(Disconnect::new(
-                                                e.handle,
-                                                DisconnectReason::RemoteDeviceTerminatedConnLowResources,
-                                            ))
-                                            .await;
+                                        host.reject_connection(e.handle);
                                         host.state.connect_command_state.canceled();
                                     }
                                 }
@@ -1471,12 +1491,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                             peer: Some(e.peer_resolvable_private_addr).filter(|a| *a.raw() != [0; 6]),
                                         },
                                     ) {
-                                        let _ = host
-                                            .async_command(Disconnect::new(
-                                                e.handle,
-                                                DisconnectReason::RemoteDeviceTerminatedConnLowResources,
-                                            ))
-                                            .await;
+                                        host.reject_connection(e.handle);
                                         host.state.connect_command_state.canceled();
                                     }
                                 }
@@ -1948,7 +1963,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         info!("[host] initialized");
 
         loop {
-            match select5(
+            match select6(
                 poll_fn(|cx| host.state.connections.poll_disconnecting(Some(cx))),
                 poll_fn(|cx| host.state.channels.poll_disconnecting(Some(cx))),
                 poll_fn(|cx| host.poll_cancelled(cx)),
@@ -1968,10 +1983,11 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                 {
                     core::future::pending::<()>()
                 },
+                host.state.rejected_connections.receive(),
             )
             .await
             {
-                Either5::First(request) => {
+                Either6::First(request) => {
                     trace!("[host] poll disconnecting links");
                     let force = match host
                         .async_command(Disconnect::new(request.handle(), request.reason()))
@@ -1996,7 +2012,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     }
                     request.confirm(force);
                 }
-                Either5::Second(request) => {
+                Either6::Second(request) => {
                     trace!("[host] poll disconnecting channels");
                     match request.send(host).await {
                         Ok(_) => {}
@@ -2009,7 +2025,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     }
                     request.confirm();
                 }
-                Either5::Third(action) => match action {
+                Either6::Third(action) => match action {
                     #[cfg(feature = "central")]
                     CancelledCommandState::Connect(_) => {
                         trace!("[host] cancel connection create");
@@ -2076,17 +2092,35 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                         host.rotate_rpa().await?;
                     }
                 },
-                Either5::Fourth(request) => {
+                Either6::Fourth(request) => {
                     #[cfg(feature = "security")]
                     {
                         let event_data = request.unwrap_or(SecurityEventData::Timeout);
                         host.state.connections.handle_security_event(host, event_data).await?;
                     }
                 }
-                Either5::Fifth(()) => {
+                Either6::Fifth(()) => {
                     #[cfg(all(feature = "security", feature = "central"))]
                     {
                         host.rotate_rpa().await?;
+                    }
+                }
+                Either6::Sixth(handle) => {
+                    trace!("[host] disconnecting rejected connection {:?}", handle);
+                    match host
+                        .async_command(Disconnect::new(
+                            handle,
+                            DisconnectReason::RemoteDeviceTerminatedConnLowResources,
+                        ))
+                        .await
+                    {
+                        Ok(_) => {}
+                        // Already gone.
+                        Err(BleHostError::BleHost(Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {}
+                        // The link was never admitted, so a failed disconnect
+                        // must not stop the host; the controller's
+                        // supervision timeout drops it eventually.
+                        Err(e) => warn!("[host] failed to disconnect rejected connection {:?}: {:?}", handle, e),
                     }
                 }
             }
