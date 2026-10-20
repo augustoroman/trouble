@@ -487,9 +487,22 @@ where
         state.request(ctx).await;
     }
 
+    /// Whether the host manages the controller's random address as a rotating
+    /// RPA. That needs a local IRK, and it must not displace a random address
+    /// the application configured: that one is the device's identity address,
+    /// and replacing it would put an address on the air that the security
+    /// manager does not use in f5/f6, failing every pairing with
+    /// `DHKeyCheckFailed`. With a configured address and a local IRK, the
+    /// controller still generates RPAs for resolving-list peers when a
+    /// procedure uses a resolvable own-address type.
+    #[cfg(all(feature = "security", feature = "central"))]
+    fn is_rpa_managed(&self) -> bool {
+        self.is_privacy_enabled() && self.state.address.is_none()
+    }
+
     #[cfg(all(feature = "security", feature = "central"))]
     fn is_rpa_rotation_ready(&self) -> bool {
-        self.is_privacy_enabled()
+        self.is_rpa_managed()
             && self.state.connect_command_state.is_idle()
             && !self.state.advertise_command_state.is_active_with(|extended| !extended)
             && self.state.scan_command_state.is_idle()
@@ -1805,16 +1818,22 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         Reset::new().exec(host.controller).await?;
 
         {
+            // A random address the application configured is its identity
+            // address and stays programmed, so advertising or connecting with
+            // `AddrKind::RANDOM` transmits the address the security manager
+            // uses in the pairing check values. A host-managed RPA is only
+            // programmed when the application left the random address to the
+            // host (see `is_rpa_rotation_ready`).
             let addr = host.state.address.map(|a| a.addr);
 
             #[cfg(all(feature = "security", feature = "central"))]
-            let addr = host.state.connections.security_manager.generate_local_rpa().or(addr);
+            let addr = addr.or_else(|| host.state.connections.security_manager.generate_local_rpa());
 
             if let Some(addr) = addr {
                 LeSetRandomAddr::new(addr).exec(host.controller).await?;
 
                 #[cfg(all(feature = "security", feature = "central"))]
-                if host.is_privacy_enabled() {
+                if host.is_rpa_managed() {
                     host.state
                         .rpa_expires_at
                         .set(Instant::now() + host.state.rpa_timeout.get());

@@ -127,8 +127,14 @@ impl IdentityResolvingKey {
         prand[2] &= 0b00111111; // Clear top 2 bits
         prand[2] |= 0b01000000; // Set 2nd bit from top
 
-        // Calculate hash using ah function
-        let hash = self.ah(prand);
+        // `ah` works on big-endian values while the address is little-endian
+        // on the wire, so convert on the way in and out, mirroring
+        // `resolve_address`. Without this the generated address does not
+        // resolve under its own key.
+        let mut prand_be = prand;
+        prand_be.reverse();
+        let mut hash = self.ah(prand_be);
+        hash.reverse();
 
         // Construct the address: prand || hash
         let mut address = [0u8; 6];
@@ -959,6 +965,20 @@ mod tests {
         let address = BdAddr::new([0x92, 0xF2, 0x8F, 0x84, 0x72, 0x4F]);
         let re = irk.resolve_address(&address);
         assert_eq!(re, true);
+    }
+
+    /// A generated RPA must resolve under the key that generated it, and
+    /// under no other key.
+    #[test]
+    pub fn generated_rpa_resolves() {
+        let irk = IdentityResolvingKey::new(0x8b3958c158ed64467bd27bc90d3cf54d).unwrap();
+        let other = IdentityResolvingKey::new(0xec0234a357c8ad05341010a60a397d9b).unwrap();
+        for _ in 0..8 {
+            let address = BdAddr::new(irk.generate_resolvable_address());
+            assert_eq!(address.raw()[5] & 0b1100_0000, 0b0100_0000);
+            assert!(irk.resolve_address(&address));
+            assert!(!other.resolve_address(&address));
+        }
     }
 
     /// LE Legacy Pairing c1 test vector ([Vol 3] Part H, Appendix D.1).
