@@ -96,12 +96,15 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
             (false, false, _) => AdvKind::AdvNonconnInd,
         };
         let peer = data.peer.unwrap_or(Address::new(AddrKind::PUBLIC, BdAddr::default()));
+        let own_addr_kind = params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind());
+        #[cfg(feature = "security")]
+        host.set_advertising_own_addr_kind(own_addr_kind);
 
         host.command(LeSetAdvParams::new(
             bt_hci_duration(params.interval_min),
             bt_hci_duration(params.interval_max),
             kind,
-            params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind()),
+            own_addr_kind,
             peer.kind,
             peer.addr,
             params.channel_map.unwrap_or(AdvChannelMap::ALL),
@@ -231,6 +234,8 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
             let params = set.params;
             let peer = data.peer.unwrap_or_default();
             let own_addr_kind = params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind());
+            #[cfg(feature = "security")]
+            host.set_advertising_own_addr_kind(own_addr_kind);
             let random_addr = if let Some(addr) = set.address {
                 Some(addr)
             } else {

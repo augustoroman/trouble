@@ -154,6 +154,10 @@ pub(crate) struct HostState<'d, P: PacketPool> {
     pub(crate) resolving_list_state: RefCell<ResolvingListSignal>,
     #[cfg(feature = "scan")]
     pub(crate) scan_timeout: Signal<NoopRawMutex, ()>,
+    /// Own address type advertising was last started with; decides whether the
+    /// local RPA a controller reports for a peripheral connection is meaningful.
+    #[cfg(feature = "security")]
+    pub(crate) advertising_own_addr_kind: Cell<Option<AddrKind>>,
     /// Connections the host could not accept, waiting for the control runner
     /// to disconnect them. See [`BleHost::reject_connection`].
     pub(crate) rejected_connections: Channel<NoopRawMutex, ConnHandle, REJECTED_CONNECTIONS_MAX>,
@@ -195,6 +199,8 @@ impl<'d, P: PacketPool> HostState<'d, P> {
             resolving_list_state: RefCell::new(ResolvingListSignal::new()),
             #[cfg(feature = "scan")]
             scan_timeout: Signal::new(),
+            #[cfg(feature = "security")]
+            advertising_own_addr_kind: Cell::new(None),
             rejected_connections: Channel::new(),
         }
     }
@@ -358,6 +364,44 @@ where
 
     pub(crate) fn advertise_state(&self) -> &AdvState<'d> {
         &self.state.advertise_state
+    }
+
+    /// Record the own address type advertising is being started with.
+    #[cfg(feature = "security")]
+    pub(crate) fn set_advertising_own_addr_kind(&self, kind: AddrKind) {
+        self.state.advertising_own_addr_kind.set(Some(kind));
+    }
+
+    /// The local RPA to use in pairing for a new connection, given the one the
+    /// controller reported in LE Enhanced Connection Complete.
+    ///
+    /// The reported address is only meaningful when the local device used a
+    /// resolvable private address type ([Vol 4] Part E, Section 7.7.65.10).
+    /// Some controllers (the CYW43439, at least) fill it in anyway whenever the
+    /// resolving list holds a local IRK, even while advertising with the
+    /// static random address. Using it then makes the pairing check values
+    /// (f5, f6) disagree with the peer's and every pairing fails with
+    /// DHKeyCheckFailed. So for a peripheral connection it is used only when
+    /// advertising asked the controller for an RPA.
+    #[cfg(feature = "security")]
+    fn connection_local_rpa(&self, role: LeConnRole, reported: BdAddr) -> Option<BdAddr> {
+        if *reported.raw() == [0; 6] {
+            return None;
+        }
+        if role == LeConnRole::Peripheral {
+            let kind = self.state.advertising_own_addr_kind.get();
+            let advertised_rpa = kind.is_some_and(|k| {
+                k == AddrKind::RESOLVABLE_PRIVATE_OR_PUBLIC || k == AddrKind::RESOLVABLE_PRIVATE_OR_RANDOM
+            });
+            if !advertised_rpa {
+                info!(
+                    "[host] ignoring reported local RPA {:?}: advertising used own address type {:?}",
+                    reported, kind
+                );
+                return None;
+            }
+        }
+        Some(reported)
     }
 
     #[cfg(feature = "scan")]
@@ -1487,7 +1531,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         },
                                         #[cfg(feature = "security")]
                                         ResolvablePrivateAddrs {
-                                            local: Some(e.local_resolvable_private_addr).filter(|a| *a.raw() != [0; 6]),
+                                            local: host.connection_local_rpa(e.role, e.local_resolvable_private_addr),
                                             peer: Some(e.peer_resolvable_private_addr).filter(|a| *a.raw() != [0; 6]),
                                         },
                                     ) {
